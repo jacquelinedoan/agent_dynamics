@@ -1,6 +1,17 @@
 .venv/
+.venv312/
 __pycache__/
 *.pyc
 .DS_Store
 command.txt
 preprint.tex
+
+# LaTeX build artifacts
+preprint.aux
+preprint.bbl
+preprint.blg
+preprint.fdb_latexmk
+preprint.fls
+preprint.log
+preprint.out
+preprint.synctex.gz
