@@ -6,6 +6,10 @@ __pycache__/
 command.txt
 preprint.tex
 
+# LaTeX styles and assets
+Styles/
+neurips_2024.sty
+
 # LaTeX build artifacts
 preprint.aux
 preprint.bbl
