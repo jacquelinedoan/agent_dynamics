@@ -1,0 +1,272 @@
+%% NeurIPS workshop submission template
+%% Based on the official NeurIPS 2024 LaTeX style
+%%
+%% SETUP: download neurips_2024.sty from https://neurips.cc/Conferences/2024/PaperInformation/StyleFiles
+%% or open this file on Overleaf and add neurips_2024.sty to the project.
+%%
+%% Compile with: pdflatex -> bibtex -> pdflatex -> pdflatex
+%%
+%% Common workshop page limits: 4 pages (content) + unlimited references.
+%% Toggle \usepackage[final]{neurips_2024} when submitting camera-ready.
+
+\documentclass{article}
+
+% -----------------------------------------------------------------------
+% NeurIPS style  (swap 'preprint' for 'final' on camera-ready)
+% -----------------------------------------------------------------------
+\usepackage[preprint]{neurips_2024}
+
+% -----------------------------------------------------------------------
+% Standard NeurIPS package stack
+% -----------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath,amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{natbib}
+
+\bibliographystyle{abbrvnat}
+
+% -----------------------------------------------------------------------
+% Title
+% -----------------------------------------------------------------------
+\title{Dynamics of Orchestrator--Worker Large Language Model Systems}
+
+% -----------------------------------------------------------------------
+% Authors  (NeurIPS format: name, affiliation, email stacked per author)
+% -----------------------------------------------------------------------
+\author{%
+  Jacqueline Doan \\
+  Royal Bank of Canada \\
+  Toronto, Ontario \\
+  \texttt{jacqueline.doan@rbc.com}
+  % add co-authors with \And:
+  % \And
+  % Author Two \\
+  % Affiliation \\
+  % \texttt{email@domain.com}
+}
+
+\begin{document}
+
+\maketitle
+
+% -----------------------------------------------------------------------
+% Abstract  (NeurIPS: ~150-250 words)
+% -----------------------------------------------------------------------
+\begin{abstract}
+% Multi-agent systems built from large language models (LLMs) route tasks
+% across specialised worker agents, yet the macroscopic dynamics that emerge
+% from these routing decisions remain poorly characterised.
+% Here we study orchestrator--worker systems through a control-theoretic lens,
+% treating the shared workspace as a state variable evolving under a switched
+% dynamical system whose switching signal is the routing sequence.
+% Three workers play complementary roles: a Researcher (expansion), a Critic
+% (contraction), and a Synthesizer (dissipation/projection).
+% We sweep routing strategies (LLM-orchestrated, random, fixed, round-robin)
+% and Synthesizer placement schedules (peer, terminal, scheduled-$k$)
+% across a set of multi-step reasoning tasks, recording routing sequences,
+% workspace embeddings, and final answers at each step.
+% Using block entropy, pre-registered motif frequencies, and inter-agent
+% timing statistics, we show that LLM orchestrators self-organise into
+% low-entropy, Synthesizer-avoiding limit cycles, while random routing
+% approaches maximum entropy.
+% Workspace-embedding divergence across replicates serves as a
+% finite-time divergence-rate proxy, revealing that routing strategy
+% is the dominant source of output variance.
+% These results establish a quantitative framework for characterising and
+% controlling the dynamical behaviour of multi-agent LLM systems.
+\end{abstract}
+
+% -----------------------------------------------------------------------
+% 1. Introduction
+% -----------------------------------------------------------------------
+\section{Introduction}
+
+Multi-agent LLM frameworks have become a dominant paradigm for complex
+reasoning tasks, yet little is known about the macroscopic dynamics that
+emerge when agents communicate through a shared workspace.
+Prior work has characterised individual agent capabilities
+\citep{CITE_singleagent}, prompt engineering for multi-step
+reasoning \citep{CITE_chainofthought}, and benchmark performance of
+collaborative agents \citep{CITE_multiagentbench}, but the dynamical
+properties of the routing process itself have received less attention.
+
+We approach this gap through the lens of switched dynamical systems
+\citep{liberzon2003switching}.
+Let $x(t) \in \mathbb{R}^d$ denote the workspace embedding at round $t$.
+The system evolves as
+\begin{equation}
+  x(t+1) = f_{\sigma(t)}\!\bigl(x(t)\bigr), \qquad \sigma(t) \in \{R, C, S\},
+  \label{eq:switched}
+\end{equation}
+where $\sigma(t)$ is the routing (switching) signal and $f_R$, $f_C$, $f_S$
+are the Researcher, Critic, and Synthesizer operators respectively.
+
+% TODO: expand with literature on agent communication, LLM stochasticity,
+%       and empirical NLP dynamics
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item We formalise orchestrator--worker LLM systems as switched dynamical
+        systems and identify the Synthesizer as a dissipative element.
+  \item We introduce a suite of routing-sequence metrics (block entropy,
+        motif frequencies, inter-arrival times) and workspace divergence
+        measures applicable to any multi-agent LLM system.
+  \item We show empirically that LLM orchestrators converge to low-entropy,
+        Synthesizer-free limit cycles, independent of task.
+\end{enumerate}
+
+% -----------------------------------------------------------------------
+% 2. Background
+% -----------------------------------------------------------------------
+\section{Background}
+
+\paragraph{Switched dynamical systems.}
+A switched system \citep{liberzon2003switching} is a family of subsystems
+$\{f_p\}_{p \in \mathcal{P}}$ together with a switching signal
+$\sigma : \mathbb{Z}_{\geq 0} \to \mathcal{P}$ that selects the active
+subsystem at each step.
+Stability depends jointly on the subsystem dynamics and on the switching
+signal; in particular, dwell-time constraints on $\sigma$ are a standard
+tool for guaranteeing stability \citep{liberzon2003switching}.
+
+\paragraph{Control-theoretic worker roles.}
+The three workers implement complementary operators on the workspace:
+\begin{itemize}
+  \item \textbf{Researcher} $f_R$: expansion — appends new content,
+        $\|x(t+1)\| \geq \|x(t)\|$.
+  \item \textbf{Critic} $f_C$: contraction — appends adversarial commentary
+        opposing prior claims \citep{lohmiller1998contraction}.
+  \item \textbf{Synthesizer} $f_S$: dissipation/projection —
+        \emph{replaces} the workspace,
+        $x(t+1) = \Pi\bigl(x(t)\bigr)$, $\|\Pi(x)\| \leq \|x\|$
+        \citep{khalil2002nonlinear}.
+\end{itemize}
+The update rule is therefore
+\begin{equation}
+  x(t+1) =
+  \begin{cases}
+    x(t) \oplus \delta_w(t) & w \in \{R, C\} \\
+    \Pi\!\bigl(x(t)\bigr)   & w = S,
+  \end{cases}
+  \label{eq:update}
+\end{equation}
+where $\oplus$ denotes text-space concatenation.
+
+% -----------------------------------------------------------------------
+% 3. Methods
+% -----------------------------------------------------------------------
+\section{Methods}
+
+\paragraph{Agent architecture.}
+Each worker receives a structured system prompt encoding its role and
+operates on a shared plain-text workspace via the Anthropic Messages API
+(\texttt{claude-haiku-4-5-20251001}).
+The orchestrator implements the feedback policy
+$\sigma(t) = \pi\bigl(x(t), r\bigr)$,
+where $r$ is the user task (reference signal).
+
+\paragraph{Experimental sweep.}
+We sweep over routing strategies
+$\in \{\text{orchestrator}, \text{random}, \text{fixed-}w, \text{round\_robin}\}$
+and Synthesizer placement schedules
+$\in \{\text{peer}, \text{terminal}, \text{scheduled-}k\}$.
+Each cell (task $\times$ placement $\times$ strategy $\times$ $T_o$) is
+replicated $k$ times with deterministic seeds.
+
+\paragraph{Embeddings.}
+Workspace and final-answer embeddings use
+\texttt{all-MiniLM-L6-v2} \citep{reimers2019sentence}
+($d=384$, $\ell_2$-normalised), loaded locally for reproducibility.
+
+% -----------------------------------------------------------------------
+% 4. Results
+% -----------------------------------------------------------------------
+\section{Results}
+
+\subsection{Routing entropy}
+
+The order-$n$ block entropy of the routing sequence is
+\begin{equation}
+  H_n = -\sum_{w \in \{R,C,S\}^n} p(w)\log_2 p(w),
+  \label{eq:block_entropy}
+\end{equation}
+where $p(w)$ is the empirical block frequency pooled across replicates
+\citep{cover2006elements}.
+
+% TODO: report H1, H2, H3 per condition; insert figure
+
+\subsection{Motif analysis}
+
+We pre-registered eight routing motifs \emph{prior} to data collection
+(Table~\ref{tab:motifs}) to avoid post-hoc inflation of significance.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Pre-registered routing motifs and observed mean counts per replicate.}
+  \label{tab:motifs}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    Motif & Interpretation & Orchestrator / Random \\
+    \midrule
+    RC     & Researcher--Critic alternation, period 2 & \\
+    RCRC   & Period-2 limit cycle                     & \\
+    RCSRCS & Three-phase rhythm (conjectured healthy)  & \\
+    RSRS   & Premature consolidation                  & \\
+    SS     & Synthesizer doublet                      & \\
+    SSSS   & Degenerate self-feeding                  & \\
+    RR     & Researcher monoculture                   & \\
+    CC     & Critic monoculture                       & \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Workspace divergence}
+
+For $K$ replicates, the finite-time divergence-rate proxy at round $t$ is
+\begin{equation}
+  \Delta(t) = \frac{1}{\binom{K}{2}}
+              \sum_{i < j} \bigl(1 - \cos(x_i(t),\, x_j(t))\bigr).
+  \label{eq:divergence}
+\end{equation}
+Increasing $\Delta(t)$ indicates sensitive dependence on the random seed,
+analogous to the finite-time Lyapunov exponent \citep{strogatz2015nonlinear}.
+
+% TODO: insert divergence-by-round figure
+
+% -----------------------------------------------------------------------
+% 5. Discussion
+% -----------------------------------------------------------------------
+\section{Discussion}
+
+% TODO
+
+% -----------------------------------------------------------------------
+% 6. Conclusion
+% -----------------------------------------------------------------------
+\section{Conclusion}
+
+% TODO
+
+% -----------------------------------------------------------------------
+% Acknowledgements  (unnumbered per NeurIPS style)
+% -----------------------------------------------------------------------
+\section*{Acknowledgements}
+
+% TODO
+
+% -----------------------------------------------------------------------
+% References
+% -----------------------------------------------------------------------
+\bibliography{references}
+
+\end{document}

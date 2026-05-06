@@ -107,13 +107,6 @@ PRE_REGISTERED_MOTIFS = [
 DEFAULT_TASKS = [
     (
         "In 'Puss in Boots', the fairytale, is Puss the good guy? Give 3 reasons for your answer."
-        
-        # "A small business owner is choosing between two payroll software "
-        # "vendors. Vendor A: $40/employee/mo, US-only support, integrates "
-        # "with QuickBooks. Vendor B: $25/employee/mo, 24/7 chat support, "
-        # "requires manual export to QuickBooks. The business has 12 "
-        # "employees, two of whom work in Canada. Recommend a vendor and "
-        # "give 3 reasons."
     ),
 ]
 
