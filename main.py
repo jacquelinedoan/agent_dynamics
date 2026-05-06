@@ -82,8 +82,12 @@ except Exception:
 # Configuration
 # ============================================================================
 
-# Use a dated model string so a paper run is reproducible. Update as needed.
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+# Default models per provider. Override with --model.
+DEFAULT_MODELS = {
+    "groq":      "llama-3.3-70b-versatile",
+    "anthropic": "claude-sonnet-4-6",
+    "lmstudio":  "local-model",
+}
 
 # Small (~80 MB), fast on CPU, fixed weights -- good defaults for a pilot.
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -93,14 +97,28 @@ WORKERS = ["R", "C", "S"]  # the symbolic alphabet for our routing sequences
 # Pre-registering the motifs we'll track BEFORE looking at any data is
 # important; adding motifs after the fact is a form of p-hacking.
 PRE_REGISTERED_MOTIFS = [
+    # Expansion-contraction cycles
     "RC",       # researcher-critic alternation, length 2
-    "RCRC",     # length-4 RC limit cycle
+    "RCRC",     # length-4 RC limit cycle (expansion-led)
+    "CRCR",     # length-4 critic-led limit cycle (contraction-led)
+    # Healthy three-phase rhythm and its building block
+    "RCS",      # single healthy triplet (building block of RCSRCS)
     "RCSRCS",   # the conjectured "healthy three-phase rhythm"
-    "RSRS",     # premature consolidation
+    # Premature compression (synthesis before sufficient expansion/critique)
+    "RS",       # expansion immediately collapsed
+    "CS",       # contraction immediately collapsed (no new information)
+    "RSRS",     # repeating premature consolidation
+    # Post-synthesis behavior (what the orchestrator does after consolidation)
+    "SR",       # post-synthesis expansion (reset/reboot)
+    "SC",       # post-synthesis contraction
+    # Synthesizer runs
     "SS",       # synthesizer doublet
     "SSSS",     # degenerate self-feeding
+    # Single-worker monocultures
     "RR",       # researcher monoculture
+    "RRRR",     # extended researcher monoculture
     "CC",       # critic monoculture
+    "CCCC",     # extended critic monoculture
 ]
 
 
@@ -155,38 +173,76 @@ Be direct and concise."""
 
 
 # ============================================================================
-# LLM call helper (single swap point for backend changes)
+# LLM backend factory + call helper
 # ============================================================================
 
-def call_llm(client, 
-             model, 
-             system, 
-             user, 
-             temperature, 
-             max_tokens=400):
+def make_client(provider, 
+                lmstudio_url="http://localhost:1234/v1"):
     """
-    client: an instantiated LLM client
-    model: model identifier string 
-    system: system prompt string 
-    user: user prompt string )
+    provider: one of "groq", "anthropic", "lmstudio"
+    Return a configured client for the given provider.
+    """
+    if provider == "groq":
+        return OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+        )
+    if provider == "anthropic":
+        try:
+            import anthropic as _anthropic
+        except ImportError:
+            print("ERROR: pip install anthropic", file=sys.stderr)
+            sys.exit(1)
+        return _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    if provider == "lmstudio":
+        return OpenAI(api_key="lm-studio", base_url=lmstudio_url)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+def call_llm(client,
+             model,
+             system,
+             user,
+             temperature,
+             max_tokens=400,
+             provider="groq"):
+    """
+    client: an instantiated LLM client (from make_client)
+    model: model identifier string
+    system: system prompt string
+    user: user prompt string
     temperature: sampling temperature (float)
     max_tokens: max tokens to generate (int)
+    provider: one of "groq", "anthropic", "lmstudio"
     Returns the generated text (str). Raises on persistent failure.
     """
+    # Groq rate-limit buffer; harmless for other providers.
+    call_delay = 2.5 if provider == "groq" else 0.0
+
     last_err = None
     for attempt in range(10):
         try:
-            time.sleep(2.5)
-            resp = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-            )
-            return resp.choices[0].message.content.strip()
+            time.sleep(call_delay)
+            if provider == "anthropic":
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                    temperature=temperature,
+                )
+                return resp.content[0].text.strip()
+            else:  # groq or lmstudio — both are OpenAI-compatible
+                resp = client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                )
+                return resp.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
             msg = str(e)
@@ -202,20 +258,22 @@ def call_llm(client,
 # Routing strategies (orchestrator + baselines)
 # ============================================================================
 
-def orchestrator_pick(client, 
-                      model, 
-                      task, 
-                      workspace, 
-                      allowed_workers, 
-                      temperature):
+def orchestrator_pick(client,
+                      model,
+                      task,
+                      workspace,
+                      allowed_workers,
+                      temperature,
+                      provider="groq"):
     """
     client: an instantiated LLM client
-    model: model identifier string 
+    model: model identifier string
     task: the user task string
     workspace: the current workspace string (may be empty)
     allowed_workers: list of worker tokens (subset of ["R","C","S"]) that the orchestrator is allowed to pick from this round
     temperature: sampling temperature (float)
-    Returns the chosen worker token (str), i.e., one of "R", "C", "S". 
+    provider: one of "groq", "anthropic", "lmstudio"
+    Returns the chosen worker token (str), i.e., one of "R", "C", "S".
     """
     valid_chars = ", ".join(allowed_workers)
     constraint = f"You may only choose among: {valid_chars}."
@@ -229,12 +287,13 @@ def orchestrator_pick(client,
         f"CURRENT WORKSPACE:\n{workspace or '(empty)'}\n\n"
         f"Next worker?"
     )
-    out = call_llm(client, 
-                   model, 
-                   system, 
-                   user, 
-                   temperature, 
-                   max_tokens=4)
+    out = call_llm(client,
+                   model,
+                   system,
+                   user,
+                   temperature,
+                   max_tokens=4,
+                   provider=provider)
     out = out.strip().upper()
 
     for ch in out:
@@ -258,13 +317,14 @@ def round_robin_pick(allowed_workers, round_num):
 # Worker invocation and workspace update rule
 # ============================================================================
 
-def run_worker(client, 
-               model, 
-               worker, 
-               task, 
-               workspace, 
-               round_num, 
-               worker_temp):
+def run_worker(client,
+               model,
+               worker,
+               task,
+               workspace,
+               round_num,
+               worker_temp,
+               provider="groq"):
     """
     client: an instantiated LLM client
     model: model identifier string
@@ -273,20 +333,20 @@ def run_worker(client,
     workspace: the current workspace string (may be empty)
     round_num: the current round number (int)
     worker_temp: sampling temperature for the worker's response (float)
+    provider: one of "groq", "anthropic", "lmstudio"
     Invoke the chosen worker on the current workspace; return its contribution."""
     template = {"R": RESEARCHER_PROMPT,
                 "C": CRITIC_PROMPT,
                 "S": SYNTHESIZER_PROMPT}[worker]
-    # System Prompt
     system = template.format(round_num=round_num)
-    # User Prompt
     user = f"USER TASK:\n{task}\n\nCURRENT WORKSPACE:\n{workspace or '(empty)'}"
-    return call_llm(client, 
-                    model, 
-                    system, 
-                    user, 
-                    worker_temp, 
-                    max_tokens=500)
+    return call_llm(client,
+                    model,
+                    system,
+                    user,
+                    worker_temp,
+                    max_tokens=500,
+                    provider=provider)
 
 
 def update_workspace(workspace, 
@@ -352,6 +412,7 @@ def run_trajectory(
     n_rounds=8,
     seed=0,
     embedder=None,
+    provider="groq",
 ):
     """Run one trajectory end-to-end. Returns a populated Trajectory."""
     rng = random.Random(seed)
@@ -368,6 +429,7 @@ def run_trajectory(
         elif routing_strategy == "orchestrator":
             worker = orchestrator_pick(
                 client, model, task, workspace, allowed, orchestrator_temp,
+                provider=provider,
             )
         elif routing_strategy == "random":
             worker = random_pick(allowed, rng)
@@ -391,6 +453,7 @@ def run_trajectory(
         # Run the chosen worker; update workspace.
         contribution = run_worker(
             client, model, worker, task, workspace, r, worker_temp,
+            provider=provider,
         )
         workspace = update_workspace(workspace, worker, contribution)
         sequence.append(worker)
@@ -402,6 +465,7 @@ def run_trajectory(
     if placement == "terminal":
         contribution = run_worker(
             client, model, "S", task, workspace, n_rounds, worker_temp,
+            provider=provider,
         )
         workspace = update_workspace(workspace, "S", contribution)
         sequence.append("S")
@@ -414,6 +478,7 @@ def run_trajectory(
         client, model, FINAL_ANSWER_PROMPT,
         f"USER TASK:\n{task}\n\nWORKSPACE:\n{workspace}",
         temperature=0.0, max_tokens=400,
+        provider=provider,
     )
 
     traj = Trajectory(
@@ -578,10 +643,7 @@ def run_experiment(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    client = OpenAI(
-        api_key=os.environ["GROQ_API_KEY"],
-        base_url="https://api.groq.com/openai/v1",
-    )
+    client = make_client(args.provider, args.lmstudio_url)
 
     embedder = None
     if not args.no_embed:
@@ -620,6 +682,7 @@ def run_experiment(args):
                                 n_rounds=args.n_rounds,
                                 seed=seed,
                                 embedder=embedder,
+                                provider=args.provider,
                             )
                             print(f"seq={''.join(traj.sequence)}")
                             return traj
@@ -670,8 +733,13 @@ def run_experiment(args):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help="LLM identifier passed to call_llm.")
+    p.add_argument("--provider", default="groq",
+                   choices=["groq", "anthropic", "lmstudio"],
+                   help="LLM backend to use.")
+    p.add_argument("--lmstudio-url", default="http://localhost:1234/v1",
+                   help="Base URL for LM Studio (only used with --provider lmstudio).")
+    p.add_argument("--model", default=None,
+                   help="LLM identifier. Defaults to a sensible model for the chosen provider.")
     p.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     p.add_argument("--no-embed", action="store_true",
                    help="Skip embeddings (for fast smoke tests).")
@@ -696,6 +764,8 @@ def parse_args():
                    help="Tiny smoke test: 1 placement, 2 strategies, k=2, 4 rounds.")
 
     args = p.parse_args()
+    if args.model is None:
+        args.model = DEFAULT_MODELS[args.provider]
     if args.pilot:
         args.placements = ["peer"]
         args.strategies = ["orchestrator", "random"]
@@ -706,10 +776,13 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    if not os.environ.get("GROQ_API_KEY"):
-        print("ERROR: set GROQ_API_KEY in your environment.", file=sys.stderr)
+    _args = parse_args()
+    _required_keys = {"groq": "GROQ_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+    _key = _required_keys.get(_args.provider)
+    if _key and not os.environ.get(_key):
+        print(f"ERROR: set {_key} in your environment.", file=sys.stderr)
         sys.exit(1)
-    run_experiment(parse_args())
+    run_experiment(_args)
 
 
 # python main.py --temperatures 0.0 0.5 1.0 --placements peer --strategies orchestrator random --k 10
