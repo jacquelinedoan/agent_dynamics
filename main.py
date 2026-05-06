@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 """
-orchestrator_pilot.py
-=====================
-Pilot experiment for: characterizing the dynamics of orchestrator-worker
-LLM systems.
-
 This is the implementation of the experiment plan we agreed on:
 
     - 3 workers with control-theoretic roles
@@ -33,18 +28,12 @@ What this script computes (the pilot metrics):
     - Workspace-embedding divergence per round (a finite-time divergence
       rate proxy -- NOT a true Lyapunov exponent; the system is stochastic).
 
-What this script does NOT do yet (TODOs marked inline):
-    - Input perturbation sweep: paraphrasing prompts at controlled embedding
-      distances to measure d_out vs d_in. See `# TODO(perturbation)`.
-    - Task success scoring (LLM-as-judge). See `# TODO(judge)`.
-    - Statistical tests (permutation, BIC piecewise vs smooth). Run those
-      offline on the saved JSON; this script just gathers data.
-    - Cost guardrails beyond a simple retry. Watch your bill.
+
 
 Setup
 -----
-    pip install anthropic sentence-transformers numpy
-    export ANTHROPIC_API_KEY=...
+    pip install openai sentence-transformers numpy
+    export GROQ_API_KEY=...
 
 Quick smoke test (~30-50 LLM calls, finishes in a few minutes)
 --------------------------------------------------------------
@@ -61,11 +50,6 @@ Larger pilot (~hundreds of calls)
 Output: JSON files under ./pilot_results/
     trajectories_<timestamp>.json   -- every run, every workspace, every embedding
     summary_<timestamp>.json        -- per-cell metrics
-
-For the FULL run described in the plan we recommend swapping `call_llm`
-to point at a self-hosted open-weights endpoint (vLLM / Ollama / TGI via
-the OpenAI-compatible API). Closed-API non-determinism and silent model
-updates make month-long sweeps non-reproducible.
 """
 
 import argparse
@@ -75,6 +59,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -83,15 +68,13 @@ from pathlib import Path
 
 import numpy as np
 
-# We use the Anthropic SDK as the default backend. To swap for a self-hosted
-# OpenAI-compatible endpoint, replace `call_llm` below; nothing else changes.
-import anthropic
+from openai import OpenAI
 
 # Local sentence-transformers gives us a frozen, reproducible embedding model
 # without an extra API dependency. Loaded lazily so --no-embed runs without it.
 try:
     from sentence_transformers import SentenceTransformer
-except ImportError:
+except Exception:
     SentenceTransformer = None
 
 
@@ -100,7 +83,7 @@ except ImportError:
 # ============================================================================
 
 # Use a dated model string so a paper run is reproducible. Update as needed.
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 # Small (~80 MB), fast on CPU, fixed weights -- good defaults for a pilot.
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -120,16 +103,17 @@ PRE_REGISTERED_MOTIFS = [
     "CC",       # critic monoculture
 ]
 
-# A tiny task set for the pilot. For the full run, replace with ~50 multi-step
-# items that have verifiable resolution criteria. See plan.
+
 DEFAULT_TASKS = [
     (
-        "A small business owner is choosing between two payroll software "
-        "vendors. Vendor A: $40/employee/mo, US-only support, integrates "
-        "with QuickBooks. Vendor B: $25/employee/mo, 24/7 chat support, "
-        "requires manual export to QuickBooks. The business has 12 "
-        "employees, two of whom work in Canada. Recommend a vendor and "
-        "give 3 reasons."
+        "In 'Puss in Boots', the fairytale, is Puss the good guy? Give 3 reasons for your answer."
+        
+        # "A small business owner is choosing between two payroll software "
+        # "vendors. Vendor A: $40/employee/mo, US-only support, integrates "
+        # "with QuickBooks. Vendor B: $25/employee/mo, 24/7 chat support, "
+        # "requires manual export to QuickBooks. The business has 12 "
+        # "employees, two of whom work in Canada. Recommend a vendor and "
+        # "give 3 reasons."
     ),
 ]
 
@@ -181,30 +165,42 @@ Be direct and concise."""
 # LLM call helper (single swap point for backend changes)
 # ============================================================================
 
-def call_llm(client, model, system, user, temperature, max_tokens=400):
+def call_llm(client, 
+             model, 
+             system, 
+             user, 
+             temperature, 
+             max_tokens=400):
     """
-    One LLM call with light retry on transient errors.
-
-    SWAP THIS FUNCTION to point at a self-hosted open-weights endpoint for
-    the production run. Everything else in the script is backend-agnostic.
+    client: an instantiated LLM client
+    model: model identifier string 
+    system: system prompt string 
+    user: user prompt string )
+    temperature: sampling temperature (float)
+    max_tokens: max tokens to generate (int)
+    Returns the generated text (str). Raises on persistent failure.
     """
     last_err = None
-    for attempt in range(3):
+    for attempt in range(10):
         try:
-            resp = client.messages.create(
+            time.sleep(2.5)
+            resp = client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
                 temperature=temperature,
             )
-            # Concatenate any text blocks (Claude can return multiple).
-            return "".join(b.text for b in resp.content if hasattr(b, "text"))
+            return resp.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt
-            print(f"  [warn] LLM call failed ({type(e).__name__}: {e}); "
-                  f"retrying in {wait}s", file=sys.stderr)
+            msg = str(e)
+            m = re.search(r'try again in ([0-9.]+)s', msg)
+            wait = max(float(m.group(1)) + 1.0 if m else 2 ** attempt, 5.0)
+            print(f"  [warn] LLM call failed ({type(e).__name__}); "
+                  f"retrying in {wait:.1f}s", file=sys.stderr)
             time.sleep(wait)
     raise RuntimeError(f"LLM call failed after retries: {last_err}")
 
@@ -213,21 +209,41 @@ def call_llm(client, model, system, user, temperature, max_tokens=400):
 # Routing strategies (orchestrator + baselines)
 # ============================================================================
 
-def orchestrator_pick(client, model, task, workspace, allowed_workers, temperature):
-    """LLM-based orchestrator: picks one of `allowed_workers` given current state."""
+def orchestrator_pick(client, 
+                      model, 
+                      task, 
+                      workspace, 
+                      allowed_workers, 
+                      temperature):
+    """
+    client: an instantiated LLM client
+    model: model identifier string 
+    task: the user task string
+    workspace: the current workspace string (may be empty)
+    allowed_workers: list of worker tokens (subset of ["R","C","S"]) that the orchestrator is allowed to pick from this round
+    temperature: sampling temperature (float)
+    Returns the chosen worker token (str), i.e., one of "R", "C", "S". 
+    """
     valid_chars = ", ".join(allowed_workers)
     constraint = f"You may only choose among: {valid_chars}."
+
     system = ORCHESTRATOR_PROMPT.format(
         worker_set_constraint=constraint, valid_chars=valid_chars,
     )
+
     user = (
         f"USER TASK:\n{task}\n\n"
         f"CURRENT WORKSPACE:\n{workspace or '(empty)'}\n\n"
         f"Next worker?"
     )
-    out = call_llm(client, model, system, user, temperature, max_tokens=4)
+    out = call_llm(client, 
+                   model, 
+                   system, 
+                   user, 
+                   temperature, 
+                   max_tokens=4)
     out = out.strip().upper()
-    # Robust parse: take the first character that's a valid worker token.
+
     for ch in out:
         if ch in allowed_workers:
             return ch
@@ -249,17 +265,40 @@ def round_robin_pick(allowed_workers, round_num):
 # Worker invocation and workspace update rule
 # ============================================================================
 
-def run_worker(client, model, worker, task, workspace, round_num, worker_temp):
-    """Invoke the chosen worker on the current workspace; return its contribution."""
+def run_worker(client, 
+               model, 
+               worker, 
+               task, 
+               workspace, 
+               round_num, 
+               worker_temp):
+    """
+    client: an instantiated LLM client
+    model: model identifier string
+    worker: one of "R", "C", "S"
+    task: the user task string
+    workspace: the current workspace string (may be empty)
+    round_num: the current round number (int)
+    worker_temp: sampling temperature for the worker's response (float)
+    Invoke the chosen worker on the current workspace; return its contribution."""
     template = {"R": RESEARCHER_PROMPT,
                 "C": CRITIC_PROMPT,
                 "S": SYNTHESIZER_PROMPT}[worker]
+    # System Prompt
     system = template.format(round_num=round_num)
+    # User Prompt
     user = f"USER TASK:\n{task}\n\nCURRENT WORKSPACE:\n{workspace or '(empty)'}"
-    return call_llm(client, model, system, user, worker_temp, max_tokens=500)
+    return call_llm(client, 
+                    model, 
+                    system, 
+                    user, 
+                    worker_temp, 
+                    max_tokens=500)
 
 
-def update_workspace(workspace, worker, contribution):
+def update_workspace(workspace, 
+                     worker, 
+                     contribution):
     """
     The dissipative-element design choice:
     - R, C : APPEND the contribution to the workspace.
@@ -546,7 +585,10 @@ def run_experiment(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    client = anthropic.Anthropic()  # picks up ANTHROPIC_API_KEY from env
+    client = OpenAI(
+        api_key=os.environ["GROQ_API_KEY"],
+        base_url="https://api.groq.com/openai/v1",
+    )
 
     embedder = None
     if not args.no_embed:
@@ -592,7 +634,7 @@ def run_experiment(args):
                             print(f"FAILED: {e}")
                             return None
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.k) as ex:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                         results = ex.map(run_rep, range(args.k))
                     cell_trajs = [t for t in results if t is not None]
                     all_trajectories.extend(cell_trajs)
@@ -671,7 +713,10 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ERROR: set ANTHROPIC_API_KEY in your environment.", file=sys.stderr)
+    if not os.environ.get("GROQ_API_KEY"):
+        print("ERROR: set GROQ_API_KEY in your environment.", file=sys.stderr)
         sys.exit(1)
     run_experiment(parse_args())
+
+
+# python main.py --temperatures 0.0 0.5 1.0 --placements peer --strategies orchestrator random --k 10
