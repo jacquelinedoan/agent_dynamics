@@ -1,0 +1,8 @@
+{
+  "task0|peer|orchestrator|T0.7": {
+    "n_replicates": 0
+  },
+  "task0|peer|random|T0.0": {
+    "n_replicates": 0
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "task0|peer|orchestrator|T0.7": {
+    "n_replicates": 2,
+    "H1_bits": 1.2987949406953985,
+    "H2_bits": 2.128085278891394,
+    "H3_bits": 2.584962500721156,
+    "motif_means": {
+      "RC": 0.5,
+      "RCRC": 0.0,
+      "CRCR": 0.0,
+      "RCS": 0.5,
+      "RCSRCS": 0.0,
+      "RS": 0.5,
+      "CS": 0.5,
+      "RSRS": 0.0,
+      "SR": 0.0,
+      "SC": 0.0,
+      "SS": 1.5,
+      "SSSS": 0.0,
+      "RR": 0.0,
+      "RRRR": 0.0,
+      "CC": 0.0,
+      "CCCC": 0.0
+    },
+    "s_inter_call_intervals": [
+      1,
+      1,
+      1
+    ],
+    "s_inter_call_mean": 1.0,
+    "s_inter_call_std": 0.0,
+    "final_output_divergence": 0.020985754548457414,
+    "workspace_divergence_per_round": [
+      0.011695462058187167,
+      0.05515998487057783,
+      0.03737006999917947,
+      0.03865250095727846
+    ]
+  },
+  "task0|peer|random|T0.0": {
+    "n_replicates": 2,
+    "H1_bits": 1.561278124459133,
+    "H2_bits": 2.521640636343318,
+    "H3_bits": 2.584962500721156,
+    "motif_means": {
+      "RC": 0.5,
+      "RCRC": 0.0,
+      "CRCR": 0.0,
+      "RCS": 0.5,
+      "RCSRCS": 0.0,
+      "RS": 0.5,
+      "CS": 0.5,
+      "RSRS": 0.0,
+      "SR": 0.5,
+      "SC": 0.5,
+      "SS": 0.0,
+      "SSSS": 0.0,
+      "RR": 0.5,
+      "RRRR": 0.0,
+      "CC": 0.0,
+      "CCCC": 0.0
+    },
+    "s_inter_call_intervals": [
+      3
+    ],
+    "s_inter_call_mean": 3.0,
+    "s_inter_call_std": 0.0,
+    "final_output_divergence": 0.031414101132261285,
+    "workspace_divergence_per_round": [
+      0.06730084634921074,
+      0.04210825755735359,
+      0.028141614967305606,
+      0.03342131537383286
+    ]
+  }
+}

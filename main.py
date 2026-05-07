@@ -28,25 +28,6 @@ What this script computes (the pilot metrics):
     - Workspace-embedding divergence per round (a finite-time divergence
       rate proxy -- NOT a true Lyapunov exponent; the system is stochastic).
 
-
-
-Setup
------
-    pip install openai sentence-transformers numpy
-    export GROQ_API_KEY=...
-
-Quick smoke test (~30-50 LLM calls, finishes in a few minutes)
---------------------------------------------------------------
-    python orchestrator_pilot.py --pilot
-
-Larger pilot (~hundreds of calls)
----------------------------------
-    python orchestrator_pilot.py \
-        --temperatures 0.0 0.5 1.0 \
-        --placements peer terminal \
-        --strategies orchestrator random \
-        --k 5
-
 Output: JSON files under ./pilot_results/
     trajectories_<timestamp>.json   -- every run, every workspace, every embedding
     summary_<timestamp>.json        -- per-cell metrics
@@ -70,10 +51,24 @@ import numpy as np
 
 from openai import OpenAI
 
-# Local sentence-transformers gives us a frozen, reproducible embedding model
-# without an extra API dependency. Loaded lazily so --no-embed runs without it.
+# fastembed uses ONNX runtime (no PyTorch needed) and runs well on CPU/Mac.
+# Loaded lazily so --no-embed runs without it.
 try:
-    from sentence_transformers import SentenceTransformer
+    from fastembed import TextEmbedding as _TextEmbedding
+
+    class _FastEmbedder:
+        def __init__(self, model_name):
+            self._model = _TextEmbedding(model_name=model_name)
+
+        def encode(self, texts, normalize_embeddings=True):
+            embs = np.array(list(self._model.embed(texts)))
+            if normalize_embeddings:
+                norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                embs = embs / norms
+            return embs
+
+    SentenceTransformer = _FastEmbedder
 except Exception:
     SentenceTransformer = None
 
@@ -89,8 +84,8 @@ DEFAULT_MODELS = {
     "lmstudio":  "local-model",
 }
 
-# Small (~80 MB), fast on CPU, fixed weights -- good defaults for a pilot.
-DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Small (~130 MB), fast on CPU, fixed weights -- good defaults for a pilot.
+DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 WORKERS = ["R", "C", "S"]  # the symbolic alphabet for our routing sequences
 
@@ -124,7 +119,10 @@ PRE_REGISTERED_MOTIFS = [
 
 DEFAULT_TASKS = [
     (
-        "In 'Puss in Boots', the fairytale, is Puss the good guy? Give 3 reasons for your answer."
+    # Simple opinon-based task: 
+    # "In 'Puss in Boots', the fairytale, is Puss the good guy? Give 3 reasons for your answer."
+    # Complex fact-rich task:
+        "Are governments doing enough to fight climate change? Provide 3 arguments to support your answer."
     ),
 ]
 
@@ -161,7 +159,7 @@ Workers:
   C (Critic)      -- challenges weak claims, contracts the workspace
   S (Synthesizer) -- compresses the workspace into a consolidated draft
 
-Read the workspace and the user task. Decide which worker should act next.
+Read the workspace and the user task. Decide which worker should act next based only on the workspace.
 {worker_set_constraint}
 
 Respond with EXACTLY ONE CHARACTER: {valid_chars}. No explanation. No punctuation."""
@@ -205,7 +203,10 @@ def call_llm(client,
              user,
              temperature,
              max_tokens=400,
-             provider="groq"):
+             provider="groq",
+             _log=None,
+             _log_meta=None,
+             _embedder=None):
     """
     client: an instantiated LLM client (from make_client)
     model: model identifier string
@@ -214,6 +215,9 @@ def call_llm(client,
     temperature: sampling temperature (float)
     max_tokens: max tokens to generate (int)
     provider: one of "groq", "anthropic", "lmstudio"
+    _log: optional list; if provided, each call appends a log entry dict
+    _log_meta: optional dict of extra fields to merge into the log entry
+    _embedder: optional embedder; if provided, embeds the user prompt and adds it to the log entry
     Returns the generated text (str). Raises on persistent failure.
     """
     # Groq rate-limit buffer; harmless for other providers.
@@ -231,7 +235,7 @@ def call_llm(client,
                     messages=[{"role": "user", "content": user}],
                     temperature=temperature,
                 )
-                return resp.content[0].text.strip()
+                result = resp.content[0].text.strip()
             else:  # groq or lmstudio — both are OpenAI-compatible
                 resp = client.chat.completions.create(
                     model=model,
@@ -242,7 +246,23 @@ def call_llm(client,
                     ],
                     temperature=temperature,
                 )
-                return resp.choices[0].message.content.strip()
+                result = resp.choices[0].message.content.strip()
+            if _log is not None:
+                entry = {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "model": model,
+                    "temperature": temperature,
+                    "system": system,
+                    "user": user,
+                    "response": result,
+                }
+                if _embedder is not None:
+                    emb = _embedder.encode([user], normalize_embeddings=True)
+                    entry["user_prompt_embedding"] = emb[0].tolist()
+                if _log_meta:
+                    entry.update(_log_meta)
+                _log.append(entry)
+            return result
         except Exception as e:
             last_err = e
             msg = str(e)
@@ -264,7 +284,10 @@ def orchestrator_pick(client,
                       workspace,
                       allowed_workers,
                       temperature,
-                      provider="groq"):
+                      provider="groq",
+                      _log=None,
+                      _log_meta=None,
+                      _embedder=None):
     """
     client: an instantiated LLM client
     model: model identifier string
@@ -287,13 +310,19 @@ def orchestrator_pick(client,
         f"CURRENT WORKSPACE:\n{workspace or '(empty)'}\n\n"
         f"Next worker?"
     )
+    meta = {"call_type": "orchestrator"}
+    if _log_meta:
+        meta.update(_log_meta)
     out = call_llm(client,
                    model,
                    system,
                    user,
                    temperature,
                    max_tokens=4,
-                   provider=provider)
+                   provider=provider,
+                   _log=_log,
+                   _log_meta=meta,
+                   _embedder=_embedder)
     out = out.strip().upper()
 
     for ch in out:
@@ -324,7 +353,10 @@ def run_worker(client,
                workspace,
                round_num,
                worker_temp,
-               provider="groq"):
+               provider="groq",
+               _log=None,
+               _log_meta=None,
+               _embedder=None):
     """
     client: an instantiated LLM client
     model: model identifier string
@@ -340,13 +372,19 @@ def run_worker(client,
                 "S": SYNTHESIZER_PROMPT}[worker]
     system = template.format(round_num=round_num)
     user = f"USER TASK:\n{task}\n\nCURRENT WORKSPACE:\n{workspace or '(empty)'}"
+    meta = {"call_type": "worker", "worker": worker, "round_num": round_num}
+    if _log_meta:
+        meta.update(_log_meta)
     return call_llm(client,
                     model,
                     system,
                     user,
                     worker_temp,
                     max_tokens=500,
-                    provider=provider)
+                    provider=provider,
+                    _log=_log,
+                    _log_meta=meta,
+                    _embedder=_embedder)
 
 
 def update_workspace(workspace, 
@@ -413,11 +451,18 @@ def run_trajectory(
     seed=0,
     embedder=None,
     provider="groq",
+    _log=None,
 ):
     """Run one trajectory end-to-end. Returns a populated Trajectory."""
     rng = random.Random(seed)
     sequence, workspaces = [], []
     workspace = ""
+
+    traj_meta = {
+        "routing_strategy": routing_strategy,
+        "placement": placement,
+        "seed": seed,
+    }
 
     for r in range(n_rounds):
         allowed = allowed_workers_for(placement, r)
@@ -429,7 +474,8 @@ def run_trajectory(
         elif routing_strategy == "orchestrator":
             worker = orchestrator_pick(
                 client, model, task, workspace, allowed, orchestrator_temp,
-                provider=provider,
+                provider=provider, _log=_log, _log_meta=traj_meta,
+                _embedder=embedder,
             )
         elif routing_strategy == "random":
             worker = random_pick(allowed, rng)
@@ -453,7 +499,8 @@ def run_trajectory(
         # Run the chosen worker; update workspace.
         contribution = run_worker(
             client, model, worker, task, workspace, r, worker_temp,
-            provider=provider,
+            provider=provider, _log=_log, _log_meta=traj_meta,
+            _embedder=embedder,
         )
         workspace = update_workspace(workspace, worker, contribution)
         sequence.append(worker)
@@ -465,7 +512,8 @@ def run_trajectory(
     if placement == "terminal":
         contribution = run_worker(
             client, model, "S", task, workspace, n_rounds, worker_temp,
-            provider=provider,
+            provider=provider, _log=_log, _log_meta=traj_meta,
+            _embedder=embedder,
         )
         workspace = update_workspace(workspace, "S", contribution)
         sequence.append("S")
@@ -479,6 +527,9 @@ def run_trajectory(
         f"USER TASK:\n{task}\n\nWORKSPACE:\n{workspace}",
         temperature=0.0, max_tokens=400,
         provider=provider,
+        _log=_log,
+        _log_meta={**traj_meta, "call_type": "final_readout"},
+        _embedder=embedder,
     )
 
     traj = Trajectory(
@@ -655,6 +706,7 @@ def run_experiment(args):
             embedder = SentenceTransformer(args.embed_model)
 
     all_trajectories = []
+    all_llm_logs = []
     summary = {}
 
     # Sweep over (task, placement, strategy, orchestrator_temp).
@@ -673,6 +725,7 @@ def run_experiment(args):
                         print(f"  rep {k+1}/{args.k} seed={seed} ...",
                               end=" ", flush=True)
                         try:
+                            rep_log = []
                             traj = run_trajectory(
                                 client, args.model, task,
                                 routing_strategy=strategy,
@@ -683,31 +736,38 @@ def run_experiment(args):
                                 seed=seed,
                                 embedder=embedder,
                                 provider=args.provider,
+                                _log=rep_log,
                             )
                             print(f"seq={''.join(traj.sequence)}")
-                            return traj
+                            return traj, rep_log
                         except Exception as e:
                             print(f"FAILED: {e}")
-                            return None
+                            return None, []
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                        results = ex.map(run_rep, range(args.k))
-                    cell_trajs = [t for t in results if t is not None]
+                        results = list(ex.map(run_rep, range(args.k)))
+                    cell_trajs = [t for t, _ in results if t is not None]
+                    for _, rep_log in results:
+                        all_llm_logs.extend(rep_log)
                     all_trajectories.extend(cell_trajs)
                     summary[cell_key] = summarize(cell_trajs)
 
-    # Persist trajectories and summary side by side.
+    # Persist trajectories, summary, and LLM call log side by side.
     stamp = time.strftime("%Y%m%d_%H%M%S")
     traj_path = out_dir / f"trajectories_{stamp}.json"
     summary_path = out_dir / f"summary_{stamp}.json"
+    log_path = out_dir / f"llm_log_{stamp}.json"
 
     with traj_path.open("w") as f:
         json.dump([asdict(t) for t in all_trajectories], f, indent=2)
     with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
+    with log_path.open("w") as f:
+        json.dump(all_llm_logs, f, indent=2)
 
     print(f"\nWrote {len(all_trajectories)} trajectories to {traj_path}")
     print(f"Wrote summary to {summary_path}")
+    print(f"Wrote {len(all_llm_logs)} LLM call logs to {log_path}")
 
     # A small inline report so you can eyeball things before opening the JSON.
     print("\n--- Pilot summary ---")
@@ -733,7 +793,7 @@ def run_experiment(args):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--provider", default="groq",
+    p.add_argument("--provider", default="anthropic",
                    choices=["groq", "anthropic", "lmstudio"],
                    help="LLM backend to use.")
     p.add_argument("--lmstudio-url", default="http://localhost:1234/v1",
@@ -785,4 +845,4 @@ if __name__ == "__main__":
     run_experiment(_args)
 
 
-# python main.py --temperatures 0.0 0.5 1.0 --placements peer --strategies orchestrator random --k 10
+# python main.py --provider anthropic --temperatures 0 --placements peer --n-rounds 10 --k 30

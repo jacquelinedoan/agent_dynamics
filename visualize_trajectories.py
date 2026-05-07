@@ -11,6 +11,7 @@ Produces two figures:
   2. Heatmap of bigram motif frequencies vs orchestrator temperature (mean count)
 """
 
+import math
 import sys
 import json
 import glob
@@ -48,19 +49,33 @@ def s_call_round(trajectory: dict) -> int | None:
 
 
 MOTIFS = [
-    "RC",       # researcher-critic alternation, length 2
-    "RCRC",     # length-4 RC limit cycle
-    "RCSRCS",   # the conjectured "healthy three-phase rhythm"
-    "RSRS",     # premature consolidation
-    "SS",       # synthesizer doublet
-    "SSSS",     # degenerate self-feeding
-    "RR",       # researcher monoculture
-    "CC",       # critic monoculture
+    # Expansion-contraction cycles
+    "RC",
+    "RCRC",
+    "CRCR",
+    # Healthy three-phase rhythm and its building block
+    "RCS",
+    "RCSRCS",
+    # Premature compression
+    "RS",
+    "CS",
+    "RSRS",
+    # Post-synthesis behavior
+    "SR",
+    "SC",
+    # Synthesizer runs
+    "SS",
+    "SSSS",
+    # Single-worker monocultures
+    "RR",
+    "RRRR",
+    "CC",
+    "CCCC",
 ]
 
 
 def motif_counts(trajectory: dict) -> Counter:
-    """Count non-overlapping occurrences of each predefined motif in the sequence."""
+    """Count overlapping occurrences of each predefined motif in the sequence."""
     seq_str = "".join(trajectory["sequence"])
     counts = Counter()
     for motif in MOTIFS:
@@ -70,7 +85,7 @@ def motif_counts(trajectory: dict) -> Counter:
             if idx == -1:
                 break
             counts[motif] += 1
-            start = idx + len(motif)
+            start = idx + 1  # overlapping, matches main.py
     return counts
 
 
@@ -152,6 +167,58 @@ def plot_motif_heatmap(trajectories: list[dict], ax: plt.Axes) -> None:
     plt.colorbar(im, ax=ax, label="Mean count per trajectory")
 
 
+# ── plot 3: recurrence plots ──────────────────────────────────────────────────
+
+def plot_recurrence_grid(trajectories: list[dict], src_path: str) -> None:
+    trajs = [t for t in trajectories if t.get("workspace_embeddings")]
+    if not trajs:
+        print("  No embeddings found; skipping recurrence plots.")
+        return
+
+    n = len(trajs)
+    ncols = math.ceil(math.sqrt(n))
+    nrows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(3.2 * ncols, 3.0 * nrows),
+                             squeeze=False)
+    flat_axes = axes.flat
+
+    for ax, traj in zip(flat_axes, trajs):
+        embs = np.array(traj["workspace_embeddings"])   # (k, d)
+        dist = np.linalg.norm(embs[:, None] - embs[None, :], axis=-1)  # (k, k)
+
+        im = ax.imshow(dist, cmap="viridis", aspect="equal",
+                       interpolation="nearest")
+        plt.colorbar(im, ax=ax, shrink=0.75, pad=0.02)
+
+        seq = "".join(traj["sequence"])
+        ax.set_title(
+            f"{traj['routing_strategy']} | {traj['placement']}\n"
+            f"T={traj['orchestrator_temp']}  {seq}",
+            fontsize=6,
+        )
+        k = len(embs)
+        ax.set_xticks(range(k))
+        ax.set_yticks(range(k))
+        ax.tick_params(labelsize=5)
+
+    for ax in list(flat_axes)[n:]:
+        ax.set_visible(False)
+
+    fig.suptitle(
+        f"Recurrence plots — Euclidean distance between workspace embeddings\n"
+        f"{os.path.basename(src_path)}",
+        fontsize=9,
+    )
+    plt.tight_layout()
+
+    out = src_path.replace(".json", "_recurrence.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def make_viz(path: str) -> None:
@@ -160,7 +227,7 @@ def make_viz(path: str) -> None:
     print(f"  {len(trajectories)} trajectories, "
           f"temps={sorted(set(t['orchestrator_temp'] for t in trajectories))}")
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 8))
     fig.suptitle(os.path.basename(path), fontsize=10, color="gray", y=1.01)
 
     plot_s_timing(trajectories, axes[0])
@@ -172,6 +239,8 @@ def make_viz(path: str) -> None:
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
+
+    plot_recurrence_grid(trajectories, path)
 
 
 def main() -> None:
